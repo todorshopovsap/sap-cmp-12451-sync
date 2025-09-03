@@ -23,7 +23,7 @@ steps:
     containerImageName: 'ums-sample-component'
   whitesourceExecuteScan:
     whitesourceProductName: 'SHC - ums-sample-component'
-    whitesourceProductToken: ''
+    whitesourceProductToken: '2cdfdaa862a548db89f3b8e16a7d1a02751a369b1c9d4837a845a95e8ad2df39'
   sonarExecuteScan:
     serverUrl: 'https://sonar.tools.sap'
     sonarVaultSecretName: 'GROUP-SECRETS/sonar-user-token'

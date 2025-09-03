@@ -1,0 +1,114 @@
+name: Sync Repos
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:  # ръчно стартиране
+
+jobs:
+  sync:
+    runs-on: self-hosted
+
+    steps:
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SYNC_SSH_KEY }}
+
+      # - name: Configure Git
+      #   run: |
+      #     git config --global user.name "UMS serviceuser"
+      #     git config --global user.email "ums-serviceuser@github.tools.sap"
+          # ssh-keyscan github.com >> ~/.ssh/known_hosts || true
+          # ssh-keyscan github.tools.sap >> ~/.ssh/known_hosts || true
+          
+    #   - name: Install git-filter-repo
+    #     run: |
+    #       pip install git-filter-repo
+    #       echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    #   - name: Clone RepoA <-> RepoB (bare) dual way replication
+    #     env:
+    #       SAP_PAT: ${{ secrets.UMS_SERVICE_USER_PAT }}
+        # run: |
+        #   # For github.tools.sap we use HTTPS + PAT
+        #   git clone --bare https://oauth2:${SAP_PAT}@github.tools.sap/ums/sample-ums-component.git repoA
+        #   cd repoA
+        #   git remote add repoB git@github.com:mlade77/sample-ums-component.git
+
+        #   echo ">>> Fetch all remotes"
+        #   git fetch --all
+
+        #   echo ">>> Sync RepoA → RepoB"
+        #   git push --prune repoB +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*
+
+        #   echo ">>> Sync RepoB → RepoA"
+        #   git fetch repoB
+        #   git push --prune origin +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*
+      - name: Checkout internal repo (repoB)
+        uses: actions/checkout@v4
+        with:
+          repository: ums/sample-ums-component
+          path: repoB
+
+      - name: Setup git and add upstream
+        run: |
+          ssh-keyscan github.com >> ~/.ssh/known_hosts || true
+          ssh-keyscan github.tools.sap >> ~/.ssh/known_hosts || true
+          cd repoB
+          git config user.name "UMS serviceuser"
+          git config user.email "ums-serviceuser@github.tools.sap"
+          git remote add upstream git@github.com:mlade77/sample-ums-component.git
+          git fetch upstream
+
+      - name: Backup .github
+        run: |
+          cd repoB
+          cp -r .github ../github-backup || echo "No .github to backup"
+
+      - name: Merge from upstream
+        run: |
+          cd repoB
+          git checkout main
+          git merge upstream/main --allow-unrelated-histories -X theirs
+
+      - name: Restore .github
+        run: |
+          cd repoB
+          rm -rf .github
+          mv ../github-backup .github || echo "No backup to restore"
+
+      - name: Commit and push
+        run: |
+          cd repoB
+          git add .github
+          git commit -m "Restore .github after merge" || echo "No changes to commit"
+          git push origin main
+
+    #     # This step do one-way mirror sync Repo A → Repo B
+    #   - name: One-way mirror sync RepoA(external sample-ums-component) → RepoB(SAP internal sample-ums-component)
+    #     env:
+    #       SAP_PAT: ${{ secrets.UMS_SERVICE_USER_PAT }}
+    #     run: |
+    #       git clone https://oauth2:${{ secrets.SAP_PAT }}@github.tools.sap/ums/sample-ums-component.git repoB
+    #       cd repoB
+
+    #       # Add RepoA as remote
+    #       git remote add upstream git@github.com:mlade77/sample-ums-component.git
+    #       git fetch --all
+
+    #       # Backup .github (workflow files in RepoB)
+    #       cp -r .github ../github-backup || echo "No .github to backup"
+
+    #       # Mirror push from repoA to repoB (all branches + tags with sync/truncate)
+    #       git push --prune origin +refs/remotes/upstream/*:refs/heads/* +refs/tags/*:refs/tags*
+
+    #       # Restore .github back in repoB
+    #       rsync -av ../github-backup/. .github/ || echo ".github already up to date"
+
+    #       # Commit restore if there are changes
+    #       git add .github
+    #       git commit -m "Restore .github after sync" || echo "No .github changes"
+
+    #       # Push .github back
+    #       git push origin main

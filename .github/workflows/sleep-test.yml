@@ -1,0 +1,51 @@
+name: Runners sleep test
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to run"
+        required: true
+        default: "10"
+        type: string
+      run_on:
+        description: "On which runner to run"
+        required: true
+        type: choice
+        options:
+          # - ubuntu-latest
+          - self-hosted
+          # - lnx-build-spot
+          # - lnx-build
+          # - lnx-test
+          # - win-build-slim
+          # - win-build
+          # - windows-latest
+
+jobs:
+  build:
+    runs-on: 
+     - ${{ github.event.inputs.run_on }}
+    # if: contains( github.event.inputs.run_on, 'lnx-' )
+    name: Sleep test on ${{ github.event.inputs.run_on }}
+    steps:
+      - name: Timeout ${{ github.event.inputs.seconds }}
+        run: |
+          # cat /etc/os-release || true
+          id || true
+          # sudo apt update || true
+          # ifconfig || true
+          kubectl version || true
+          gardenlogin version  || true
+          kubectl-gardenlogin || true
+          helmfile version || true
+          nslookup api.wa26nrl2xj.ums.internal.canary.k8s.ondemand.com || true
+          nslookup gardener-live.accounts.ondemand.com || true
+          nslookup api.wa26nrl2xj.ums.shoot.canary.k8s-hana.ondemand.com || true
+          # echo ${{ github.run_id }}
+          # env
+          seconds=${{ github.event.inputs.seconds }}
+          for ((i=seconds; i>0; i--)); do
+            echo "$i sec."
+            sleep 1
+          done
+          echo "Done!" 

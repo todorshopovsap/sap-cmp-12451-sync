@@ -1,0 +1,183 @@
+name: Sync public main → internal main (FF | PR fallback | Force-mirror)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GHES typically runs at 5-min granularity
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: todorshopovsap/sap-cmp-12451-sync
+  BRANCH: main
+  SYNC_LABEL: sync-bot
+  SYNC_MODE: force_mirror        # <- set to "force_mirror" or "pr_fallback"
+  OVERLAY_PATHS: ".github .pipeline"  # preserved from current origin/main on top of upstream
+
+jobs:
+  sync:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout internal repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Preflight – compare SHAs (skip if equal)
+        id: pre
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            UPSTREAM_SHA=$(git ls-remote --heads https://github.com/${UPSTREAM_REPO}.git ${BRANCH} | awk '{print $1}') && break || sleep 2
+          done
+          if [ -z "${UPSTREAM_SHA:-}" ]; then echo "Failed to resolve upstream SHA"; exit 1; fi
+          if git ls-remote --exit-code --heads origin ${BRANCH} >/dev/null 2>&1; then
+            LOCAL_SHA=$(git rev-parse --verify origin/${BRANCH})
+          else
+            LOCAL_SHA=""
+          fi
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "local_sha=${LOCAL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "equal=$([ -n "${LOCAL_SHA}" ] && [ "${UPSTREAM_SHA}" = "${LOCAL_SHA}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Upstream ${BRANCH} @ ${UPSTREAM_SHA}"
+          echo "Internal origin/${BRANCH} @ ${LOCAL_SHA:-<none>}"
+
+      - name: Early exit (no changes)
+        if: steps.pre.outputs.equal == 'true'
+        run: |
+          echo "No upstream changes; nothing to do."
+          {
+            echo "### Sync result"
+            echo "- Upstream: ${{ steps.pre.outputs.upstream_sha }}"
+            echo "- Internal: ${{ steps.pre.outputs.local_sha }}"
+            echo "- No changes."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Add upstream & fetch ONLY main (shallow)
+        if: steps.pre.outputs.equal != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote | grep -qx upstream || git remote add upstream https://github.com/${UPSTREAM_REPO}.git
+          for i in 1 2 3; do git fetch --no-tags upstream ${BRANCH} --depth=1 && break || sleep 2; done
+
+      # ------- MODE: FAST-FORWARD or PR FALLBACK -------
+      - name: Try fast-forward internal main
+        if: steps.pre.outputs.equal != 'true' && env.SYNC_MODE != 'force_mirror'
+        id: ff
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git show-ref --verify --quiet refs/heads/${BRANCH}; then
+            if git ls-remote --exit-code --heads origin ${BRANCH} >/dev/null 2>&1; then
+              git checkout -b ${BRANCH} origin/${BRANCH}
+            else
+              git checkout -B ${BRANCH} upstream/${BRANCH}
+              for i in 1 2 3; do git push -u origin ${BRANCH} && break || sleep 2; done
+              echo "updated=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          else
+            git checkout ${BRANCH}
+          fi
+
+          BEHIND=$(git rev-list --count ${BRANCH}..upstream/${BRANCH} || echo 0)
+          AHEAD=$(git rev-list --count upstream/${BRANCH}..${BRANCH} || echo 0)
+          echo "Behind=${BEHIND} Ahead=${AHEAD}"
+
+          if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
+            git merge --ff-only upstream/${BRANCH}
+            for i in 1 2 3; do git push origin ${BRANCH} && break || sleep 2; done
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open/Update PR fallback (not FF)
+        if: steps.pre.outputs.equal != 'true' && env.SYNC_MODE != 'force_mirror' && steps.ff.outputs.updated == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SYNC_BRANCH="sync/upstream-${BRANCH}"
+          git checkout -B "${SYNC_BRANCH}" "upstream/${BRANCH}"
+          for i in 1 2 3; do git push -f origin "${SYNC_BRANCH}" && break || sleep 2; done
+
+          API="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
+          UPSTREAM_SHA="${{ steps.pre.outputs.upstream_sha }}"
+
+          EXISTING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "$API/pulls?head=${OWNER}:${SYNC_BRANCH}&base=${BRANCH}&state=open" | jq '.[0].number // empty')
+
+          TITLE="Sync public → internal: ${BRANCH} @ ${UPSTREAM_SHA}"
+          BODY=$'Automated sync PR (FF not possible).\nSource: https://github.com/'"${UPSTREAM_REPO}"$'\nThis PR makes internal '"${BRANCH}"$' match upstream '"${BRANCH}"$'.'
+
+          if [ -z "$EXISTING" ]; then
+            PR_NUM=$(curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$API/pulls" -d "$(jq -n --arg t "$TITLE" --arg b "$BODY" --arg head "${SYNC_BRANCH}" --arg base "${BRANCH}" '{title:$t, body:$b, head:$head, base:$base}')" | jq -r '.number')
+            echo "Opened sync PR #${PR_NUM}."
+            curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$API/issues/${PR_NUM}/labels" -d "$(jq -n --arg l "${SYNC_LABEL}" '{labels:[$l]}')" >/dev/null || true
+          else
+            curl -s -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$API/pulls/$EXISTING" -d "$(jq -n --arg t "$TITLE" --arg b "$BODY" '{title:$t, body:$b}')" >/dev/null || true
+            echo "Updated existing sync PR #$EXISTING."
+          fi
+
+      # ------- MODE: FORCE MIRROR (authoritative upstream) -------
+      - name: Force-mirror internal main to upstream (preserve overlays)
+        if: steps.pre.outputs.equal != 'true' && env.SYNC_MODE == 'force_mirror'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Start from upstream/main
+          git checkout -B ${BRANCH} upstream/${BRANCH}
+
+          # Restore overlays from *current remote* main (if it exists)
+          if git ls-remote --exit-code --heads origin ${BRANCH} >/dev/null 2>&1; then
+            for p in ${OVERLAY_PATHS}; do
+              git checkout origin/${BRANCH} -- "$p" 2>/dev/null || true
+            done
+          fi
+
+          # Commit overlays if any changes staged
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "Restore internal overlays (${OVERLAY_PATHS}) on top of upstream ${BRANCH}"
+          fi
+
+          # Push, overwriting internal main to match upstream (+ overlays)
+          # Requires branch protection to allow force pushes, or disables protection.
+          for i in 1 2 3; do git push --force-with-lease origin ${BRANCH} && break || sleep 2; done
+          echo "Force-mirrored ${BRANCH} to upstream plus overlays."
+
+      - name: Summary
+        run: |
+          {
+            echo "### Sync result"
+            echo "- Upstream: ${{ steps.pre.outputs.upstream_sha }}"
+            echo "- Internal before: ${{ steps.pre.outputs.local_sha }}"
+            echo "- Mode: ${SYNC_MODE}"
+            if [ "${{ steps.pre.outputs.equal }}" = "true" ]; then
+              echo "- No changes."
+            else
+              if [ "${SYNC_MODE}" = "force_mirror" ]; then
+                echo "- Force-mirrored internal ${BRANCH} to upstream (preserved: ${OVERLAY_PATHS})."
+              else
+                if [ "${{ steps.ff.outputs.updated || 'false' }}" = "true" ]; then
+                  echo "- Fast-forwarded internal ${BRANCH}."
+                else
+                  echo "- Opened/updated PR: sync/upstream-${BRANCH} → ${BRANCH}."
+                fi
+              fi
+            fi
+          } >> $GITHUB_STEP_SUMMARY
