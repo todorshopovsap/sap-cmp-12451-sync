@@ -1,1 +1,1 @@
-# sap-cmp-12451-sync
+# sample-ums-component
